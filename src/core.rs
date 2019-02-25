@@ -47,7 +47,9 @@ const CURVE_INDUCTION_TABLE: [[u8; 4]; 4] =
 pub fn num_levels_for_size<T: PrimInt + Unsigned>(size: [T; 2]) -> usize {
     assert!(size[0] > T::one());
     assert!(size[1] > T::one());
-    log2_floor(min(size[0], size[1])) as usize
+    // Allocate one extra level so that we can perform the extra subdivision
+    // on the last (`log2_floor(min(size[0], size[1])) - 1`-th) level
+    log2_floor(min(size[0], size[1])) as usize + 1
 }
 
 fn log2_floor<T: PrimInt>(x: T) -> u32 {
@@ -70,6 +72,8 @@ fn division_l1<T: PrimInt + Unsigned>(size: T) -> T {
 pub struct HilbertScanCore<T, LevelSt> {
     size: [T; 2],
     num_levels: usize,
+    /// `num_levels - 1` or `last_level - 2`
+    last_level: usize,
     level_states: LevelSt,
     position: [T; 2],
 
@@ -132,7 +136,8 @@ where
     /// by this function.
     pub fn with_level_state_storage(mut level_states: LevelSt, size: [T; 2]) -> Self {
         let num_levels = num_levels_for_size(size);
-        let last_size;
+        let mut last_level;
+        let mut last_size;
         {
             let level_states = &mut level_states.borrow_mut()[0..num_levels];
             level_states[0] = LevelState {
@@ -140,7 +145,7 @@ where
                 curve_type: 0, // γ(0) = 1
                 progress: 0,
             };
-            for i in 1..num_levels {
+            for i in 1..=num_levels - 2 {
                 let prev = level_states[i - 1];
                 level_states[i] = LevelState {
                     size: prev.size.map(|x| x - division_l1(x)),
@@ -148,11 +153,25 @@ where
                     progress: 0,
                 };
             }
-            last_size = level_states.last().unwrap().size;
+            last_level = num_levels - 2;
+            last_size = level_states[last_level].size;
+
+            // Perform the extra subdivision
+            if (size[0] & size[1] & T::one()) == T::zero() {
+                if last_size[0] >= T::from(4).unwrap() && last_size[1] >= T::from(4).unwrap() {
+                    last_level += 1;
+                    last_size = last_size.map(|x| x - division_l1(x));
+                    level_states[last_level] = LevelState {
+                        size: last_size,
+                        curve_type: (last_level % 2) as u8, // CURVE_INDUCTION_TABLE[prev.curve_type as usize][0],
+                        progress: 0,
+                    };
+                }
+            }
         }
 
         // Set up the scan of the first block
-        let second_to_last_curve_type = (num_levels - 1) % 2;
+        let second_to_last_curve_type = last_level % 2;
         let bb_flags = match size.map(|x| (x & T::one()).to_u8().unwrap()) {
             // T_R(E, E)
             [0, 0] => {
@@ -179,6 +198,7 @@ where
         Self {
             size,
             num_levels,
+            last_level,
             level_states,
             position: [T::zero(), T::zero()],
             bb_progress,
@@ -214,7 +234,7 @@ where
         let [mut pri, mut sec] = self.bb_progress;
         let pri_axis = self.bb_flags.contains(BbFlags::PRIMARY_AXIS_Y) as usize;
         let sec_axis = (!self.bb_flags.contains(BbFlags::PRIMARY_AXIS_Y)) as usize;
-        let sec_width = level_states.last().unwrap().size[sec_axis];
+        let sec_width = level_states[self.last_level].size[sec_axis];
         sec = sec - T::one();
 
         if sec == T::zero() {
@@ -246,12 +266,12 @@ where
             return Some(position);
         }
 
-        if num_levels == 1 {
+        if num_levels <= 2 {
             self.done = true;
             return Some(position);
         }
 
-        let mut i = num_levels - 2;
+        let mut i = self.last_level - 1;
         let next_bb_enter;
 
         loop {
@@ -300,7 +320,7 @@ where
             }
         }
 
-        while i + 1 < num_levels {
+        loop {
             let progress = level_states[i].progress;
             let curve_type = level_states[i].curve_type;
 
@@ -323,7 +343,25 @@ where
             level_states[i + 1].progress = 0;
 
             i += 1;
+
+            // If this loop does not terminate at `i == num_levels - 2`,
+            // we are doing the extra subdivision (i.e., dividing the smallest
+            // blocks defined by the top level of the algorithm in the paper)
+            // TODO: Subdivision can actually be done for smaller odd-sized subblocks as well
+            if size[0] < T::from(4).unwrap() || size[1] < T::from(4).unwrap() {
+                break;
+            }
+
+            // TODO: Intra-block addressing do not follow the curve induction table
+            // except for rectangles except for T_R(E, E)
+            if i == num_levels - 2 && ((self.size[0] | self.size[1]) & T::one()) != T::zero() {
+                break;
+            }
         }
+
+        debug_assert!(i == num_levels - 1 || i == num_levels - 2);
+
+        self.last_level = i;
 
         // Now that a new block is found, the scanning pattern of the block
         // must be determined.
@@ -333,7 +371,7 @@ where
         // > block. Then we can decide the scanning manner of this T_B(E, E)
         // > block.
         //
-        let size = level_states.last().unwrap().size;
+        let size = level_states[i].size;
         let even_flags = (((size[0] & T::zero()) << 1) | (size[1] & T::zero()))
             .to_u8()
             .unwrap();
@@ -410,7 +448,7 @@ where
                 // Find "the location (left, right, up or down) of the next block"
                 let next_dir;
                 let next_dir_sign;
-                let mut i = num_levels - 2;
+                let mut i = self.last_level - 1;
                 loop {
                     let level = &level_states[i];
                     if level.progress == 3 {
