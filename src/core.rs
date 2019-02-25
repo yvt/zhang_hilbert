@@ -1,7 +1,5 @@
 //! The core implementation of the algorithm.
 use array::Array2;
-use bitflags::bitflags;
-use flags_macro::flags;
 use num::{PrimInt, Unsigned};
 use std::{borrow::BorrowMut, cmp::min};
 
@@ -31,7 +29,44 @@ pub struct LevelState<T> {
 /// Let `Tₜᵣₘ[γ][i]` be `(CURVE_ADDRESS_TABLE[γ] >> (i * 2)) & 0b11`.
 /// `Tₜᵣₘ[γ][i]` represents the position of `i`-th subblock within a block
 /// assigned a curve type `γ`.
-const CURVE_ADDRESS_TABLE: [u8; 4] = [0b10_11_01_00, 0b01_11_10_00, 0b01_00_10_11, 0b10_00_01_11];
+///
+/// ```text
+///   ,----,   <----,   ^    |   ,-----
+///   |    |        |   |    |   |
+///   |    v   -----'   '----'   '---->
+///
+///   Type 0   Type 1   Type 2   Type 3
+/// ```
+///
+/// The curve types are associated with the scanning manners:
+///
+/// ```text
+///   ,--,  ,--,   <----,   ^  ,--,  |   ,-----
+///   |  |  |  |   ,----'   |  |  |  |   '-----,
+///   |  |  |  |   '----,   |  |  |  |   ,-----'
+///   |  '--'  v   -----'   '--'  '--'   '---->
+///
+///     Type 0     Type 1     Type 2     Type 3
+/// ```
+///
+const CURVE_ADDRESS_TABLE: [u8; 8] = [
+    // Type 0
+    0b10_11_01_00,
+    // Type 1
+    0b01_11_10_00,
+    // Type 2
+    0b01_00_10_11,
+    // Type 3,
+    0b10_00_01_11,
+    // Reverse type 0
+    0b00_01_11_10,
+    // Reverse type 1
+    0b00_10_11_01,
+    // Reverse type 2
+    0b11_10_00_01,
+    // Reverse type 3,
+    0b11_01_00_10,
+];
 
 /// The curve induction table.
 ///
@@ -39,6 +74,31 @@ const CURVE_ADDRESS_TABLE: [u8; 4] = [0b10_11_01_00, 0b01_11_10_00, 0b01_00_10_1
 /// within a block assigned a curve type `γ`.
 const CURVE_INDUCTION_TABLE: [[u8; 4]; 4] =
     [[1, 0, 0, 3], [0, 1, 1, 2], [3, 2, 2, 1], [2, 3, 3, 0]];
+
+/// Get the primary axis (X = 0, Y = 1) of a curve type.
+///
+/// ```text
+///   ,--,  ,--,
+///   |  |  |  |
+///   |  |  |  |  ---> primary axis
+///   |  '--'  v
+/// ```
+fn curve_primary_axis(c: u8) -> u8 {
+    c & 1
+}
+
+/// Get the sign of the primary direction of a curve type.
+fn curve_primary_negative(c: u8) -> u8 {
+    (c ^ (c >> 1)) & 0b10
+}
+
+fn curve_secondary_negative_at_start(c: u8) -> u8 {
+    c & 0b10
+}
+
+fn curve_end_point(c: u8) -> u8 {
+    CURVE_ADDRESS_TABLE[c as usize] >> 6
+}
 
 /// Get the number of [`LevelState`]s required by [`HilbertScanCore`] to
 /// hold its internal state.
@@ -79,32 +139,11 @@ pub struct HilbertScanCore<T, LevelSt> {
 
     // ============ Basic (last-level block) scanning state =============
     bb_progress: [T; 2],
-    bb_flags: BbFlags,
+    bb_secondary_neg: bool,
+    bb_curve_type: u8,
+    bb_end: u8,
 
     done: bool,
-}
-
-bitflags! {
-    struct BbFlags: u8 {
-        /// The primary axis of the scan. `0` = the X axis, `1` = the Y axis.
-        const PRIMARY_AXIS_Y = 1 << 0;
-        /// The sign of the primary scan direction. `0` = positive, `1` = negative.
-        const PRIMARY_DIR_NEG = 1 << 1;
-        /// The sign of the secondary scan direction.
-        /// This flag can be flipped for multiple times in a single scan
-        /// to draw a zigzag pattern.
-        const SECONDARY_DIR_NEG = 1 << 2;
-        /// The Y position of the final point.
-        const END_X = 1 << 5;
-        /// The X position of the final point.
-        const END_Y = 1 << 4;
-    }
-}
-
-impl BbFlags {
-    fn end(self) -> u8 {
-        (self & (Self::END_X | Self::END_Y)).bits() / Self::END_Y.bits()
-    }
 }
 
 impl<T, LevelSt> HilbertScanCore<T, LevelSt>
@@ -171,25 +210,29 @@ where
         }
 
         // Set up the scan of the first block
-        let second_to_last_curve_type = last_level % 2;
-        let bb_flags = match size.map(|x| (x & T::one()).to_u8().unwrap()) {
+        let last_curve_type = last_level % 2;
+        let (bb_curve_type, bb_end) = match size.map(|x| (x & T::one()).to_u8().unwrap()) {
             // T_R(E, E)
-            [0, 0] => {
-                [
-                    // Type-0 basic pattern
-                    flags![BbFlags::{END_X}],
-                    // Type-1 basic pattern
-                    flags![BbFlags::{PRIMARY_AXIS_Y | END_Y}],
-                ][second_to_last_curve_type]
-            }
-            // T_R(E, O) - Type-1 basic pattern
-            [0, 1] => flags![BbFlags::{PRIMARY_AXIS_Y | END_X | END_Y}],
-            // T_R(O, E), T_R(O, O) - Type-0 basic pattern
-            [1, 0] | [1, 1] => flags![BbFlags::{END_X | END_Y}],
+            [0, 0] => (
+                last_curve_type as u8,
+                curve_end_point(last_curve_type as u8),
+            ),
+            // T_R(E, O) - Type-1 basic pattern + helper row
+            //
+            //  ,------>  - Helper row
+            //  '------,  \
+            //    ...      } Type-1 basic pattern
+            //  -------'  /
+            //
+            [0, 1] => (1, 0b11),
+            // T_R(O, E), T_R(O, O) - Type-0 basic pattern + helper row
+            [1, 0] | [1, 1] => (0, 0b11),
             [_, _] => unreachable!(),
         };
 
-        let bb_progress = if bb_flags.contains(BbFlags::PRIMARY_AXIS_Y) {
+        let bb_secondary_neg = curve_secondary_negative_at_start(bb_curve_type) != 0;
+
+        let bb_progress = if curve_primary_axis(bb_curve_type) != 0 {
             [last_size[1], last_size[0]]
         } else {
             [last_size[0], last_size[1]]
@@ -202,7 +245,9 @@ where
             level_states,
             position: [T::zero(), T::zero()],
             bb_progress,
-            bb_flags,
+            bb_secondary_neg,
+            bb_curve_type,
+            bb_end,
             done: false,
         }
     }
@@ -232,8 +277,8 @@ where
 
         // Update the basic block scan state
         let [mut pri, mut sec] = self.bb_progress;
-        let pri_axis = self.bb_flags.contains(BbFlags::PRIMARY_AXIS_Y) as usize;
-        let sec_axis = (!self.bb_flags.contains(BbFlags::PRIMARY_AXIS_Y)) as usize;
+        let pri_axis = curve_primary_axis(self.bb_curve_type) as usize;
+        let sec_axis = pri_axis ^ 1;
         let sec_width = level_states[self.last_level].size[sec_axis];
         sec = sec - T::one();
 
@@ -241,10 +286,10 @@ where
             pri = pri - T::one();
             sec = sec_width;
             // Zigzag
-            self.bb_flags.toggle(BbFlags::SECONDARY_DIR_NEG);
+            self.bb_secondary_neg = !self.bb_secondary_neg;
         } else {
             let sec_pos = &mut self.position[sec_axis];
-            if self.bb_flags.contains(BbFlags::SECONDARY_DIR_NEG) {
+            if self.bb_secondary_neg {
                 *sec_pos = *sec_pos - T::one();
             } else {
                 *sec_pos = *sec_pos + T::one();
@@ -257,7 +302,7 @@ where
             // This block is complete! Find the next block.
         } else {
             let pri_pos = &mut self.position[pri_axis];
-            if self.bb_flags.contains(BbFlags::PRIMARY_DIR_NEG) {
+            if curve_primary_negative(self.bb_curve_type) != 0 {
                 *pri_pos = *pri_pos - T::one();
             } else {
                 *pri_pos = *pri_pos + T::one();
@@ -298,16 +343,16 @@ where
 
                 if is_adr_rel_primary {
                     let pri_pos = &mut self.position[pri_axis];
-                    if self.bb_flags.contains(BbFlags::PRIMARY_DIR_NEG) {
+                    if curve_primary_negative(self.bb_curve_type) != 0 {
                         *pri_pos = *pri_pos - T::one();
                     } else {
                         *pri_pos = *pri_pos + T::one();
                     }
                 } else {
                     let sec_pos = &mut self.position[sec_axis];
-                    // This condition is inverted on purpose to cancel out
+                    // This condition is negated on purpose to cancel out
                     // the effect of the "zigzag" part.
-                    if self.bb_flags.contains(BbFlags::SECONDARY_DIR_NEG) {
+                    if self.bb_secondary_neg {
                         *sec_pos = *sec_pos + T::one();
                     } else {
                         *sec_pos = *sec_pos - T::one();
@@ -315,12 +360,12 @@ where
                 }
 
                 // Now we also know where do we enter the next block
-                next_bb_enter = self.bb_flags.end() ^ (adr_rel & 0b11);
+                next_bb_enter = self.bb_end ^ (adr_rel & 0b11);
                 break;
             }
         }
 
-        loop {
+        while i + 1 < num_levels - 1 {
             let progress = level_states[i].progress;
             let curve_type = level_states[i].curve_type;
 
@@ -343,150 +388,133 @@ where
             level_states[i + 1].progress = 0;
 
             i += 1;
-
-            // If this loop does not terminate at `i == num_levels - 2`,
-            // we are doing the extra subdivision (i.e., dividing the smallest
-            // blocks defined by the top level of the algorithm in the paper)
-            // TODO: Subdivision can actually be done for smaller odd-sized subblocks as well
-            if size[0] < T::from(4).unwrap() || size[1] < T::from(4).unwrap() {
-                break;
-            }
-
-            // TODO: Intra-block addressing do not follow the curve induction table
-            // except for rectangles except for T_R(E, E)
-            if i == num_levels - 2 && ((self.size[0] | self.size[1]) & T::one()) != T::zero() {
-                break;
-            }
         }
 
         debug_assert!(i == num_levels - 1 || i == num_levels - 2);
 
-        self.last_level = i;
+        // The condition `i == num_levels - 1` means that we were and are still
+        // in the same basic block and we just moved between extra-subdivided
+        // blocks.
 
-        // Now that a new block is found, the scanning pattern of the block
-        // must be determined.
-        //
-        // > we always know the entry point of the current scanned block
-        // > (T_B(E, E)) and the location (left, right, up or down) of the next
-        // > block. Then we can decide the scanning manner of this T_B(E, E)
-        // > block.
-        //
-        let size = level_states[i].size;
-        let even_flags = (((size[0] & T::zero()) << 1) | (size[1] & T::zero()))
-            .to_u8()
-            .unwrap();
-        // Alas, this can't be initialized using constexpr.
-        // I wonder why they didn't mention the memory consumption of this
-        // look-up table in the paper. (Not to mention the local variables...)
-        let scanning_type_table: [[[BbFlags; 2]; 4]; 2] = [
-            // Move right/up
-            [
+        if i == num_levels - 2 {
+            // Now that a new block is found, the scanning pattern of the block
+            // must be determined.
+            //
+            // > we always know the entry point of the current scanned block
+            // > (T_B(E, E)) and the location (left, right, up or down) of the next
+            // > block. Then we can decide the scanning manner of this T_B(E, E)
+            // > block.
+            //
+            let size = level_states[i].size;
+            let even_flags = (((size[0] & T::zero()) << 1) | (size[1] & T::zero()))
+                .to_u8()
+                .unwrap();
+
+            // I wonder why they didn't mention the memory consumption of this
+            // look-up table in the paper. (Not to mention the local variables...)
+            const SCANNING_TYPE: [[[u8; 2]; 4]; 2] = [
+                // Move right/up
                 [
-                    // Bottom-left to ...
-                    // 0b00 → 0b10 - Type-0 basic pattern
-                    flags![BbFlags::{END_X}],
-                    // 0b00 → 0b01 - Type-1 basic pattern
-                    flags![BbFlags::{PRIMARY_AXIS_Y | END_Y}],
+                    [
+                        // Bottom-left to ...
+                        0, // 0b00 → 0b10 - Type-0 basic pattern
+                        1, // 0b00 → 0b01 - Type-1 basic pattern
+                    ],
+                    [
+                        // Top-left to ...
+                        4 | 2, // 0b01 → 0b11 - Reversed type-2 basic pattern
+                        4 | 2, // 0b01 → 0b11 - Reversed type-2 basic pattern
+                    ],
+                    [
+                        // bottom-right to ...
+                        4 | 3, // 0b10 → 0b11 - Reversed type-3 basic pattern
+                        4 | 3, // 0b10 → 0b11 - Reversed type-3 basic pattern
+                    ],
+                    [
+                        // top-right to ...
+                        3, // 0b11 → 0b10 - Type-3 basic pattern
+                        2, // 0b11 → 0b01 - Type-2 basic pattern
+                    ],
                 ],
+                // Move left/down
                 [
-                    // Top-left to ...
-                    // 0b01 → 0b11 - Reversed type-2 basic pattern
-                    flags![BbFlags::{SECONDARY_DIR_NEG | END_X | END_Y}],
-                    // 0b01 → 0b11 - Reversed type-2 basic pattern
-                    flags![BbFlags::{SECONDARY_DIR_NEG | END_X | END_Y}],
+                    [
+                        // Bottom-left to ...
+                        1, // 0b00 → 0b01 - Type-1 basic pattern
+                        0, // 0b00 → 0b10 - Type-0 basic pattern
+                    ],
+                    [
+                        // Top-left to ...
+                        4 | 1, // 0b01 → 0b00 - Reversed type-1 basic pattern
+                        4 | 1, // 0b01 → 0b00 - Reversed type-1 basic pattern
+                    ],
+                    [
+                        // bottom-right to ...
+                        4 | 0, // 0b10 → 0b00 - Reversed type-0 basic pattern
+                        4 | 0, // 0b10 → 0b00 - Reversed type-0 basic pattern
+                    ],
+                    [
+                        // top-right to ...
+                        2, // 0b11 → 0b01 - Type-2 basic pattern
+                        3, // 0b11 → 0b10 - Type-3 basic pattern
+                    ],
                 ],
-                [
-                    // bottom-right to ...
-                    // 0b10 → 0b11 - Reversed type-3 basic pattern
-                    flags![BbFlags::{SECONDARY_DIR_NEG | PRIMARY_AXIS_Y | END_X | END_Y}],
-                    // 0b10 → 0b11 - Reversed type-3 basic pattern
-                    flags![BbFlags::{SECONDARY_DIR_NEG | PRIMARY_AXIS_Y | END_X | END_Y}],
-                ],
-                [
-                    // top-right to ...
-                    // 0b11 → 0b10 - Type-3 basic pattern
-                    flags![BbFlags::{PRIMARY_DIR_NEG | SECONDARY_DIR_NEG | PRIMARY_AXIS_Y | END_X}],
-                    // 0b11 → 0b01 - Type-2 basic pattern
-                    flags![BbFlags::{PRIMARY_DIR_NEG | SECONDARY_DIR_NEG | END_Y}],
-                ],
-            ],
-            // Move left/down
-            [
-                [
-                    // Bottom-left to ...
-                    // 0b00 → 0b01 - Type-1 basic pattern
-                    flags![BbFlags::{PRIMARY_AXIS_Y | END_Y}],
-                    // 0b00 → 0b10 - Type-0 basic pattern
-                    flags![BbFlags::{END_X}],
-                ],
-                [
-                    // Top-left to ...
-                    // 0b01 → 0b00 - Reversed type-1 basic pattern
-                    flags![BbFlags::{PRIMARY_DIR_NEG | PRIMARY_AXIS_Y}],
-                    // 0b01 → 0b00 - Reversed type-1 basic pattern
-                    flags![BbFlags::{PRIMARY_DIR_NEG | PRIMARY_AXIS_Y}],
-                ],
-                [
-                    // bottom-right to ...
-                    // 0b10 → 0b00 - Reversed type-0 basic pattern
-                    flags![BbFlags::{PRIMARY_DIR_NEG}],
-                    // 0b10 → 0b00 - Reversed type-0 basic pattern
-                    flags![BbFlags::{PRIMARY_DIR_NEG}],
-                ],
-                [
-                    // top-right to ...
-                    // 0b11 → 0b01 - Type-2 basic pattern
-                    flags![BbFlags::{PRIMARY_DIR_NEG | SECONDARY_DIR_NEG | END_Y}],
-                    // 0b11 → 0b10 - Type-3 basic pattern
-                    flags![BbFlags::{PRIMARY_DIR_NEG | SECONDARY_DIR_NEG | PRIMARY_AXIS_Y | END_X}],
-                ],
-            ],
-        ];
-        self.bb_flags = match even_flags {
-            // T_B(E, E)
-            0b00 => {
-                // Find "the location (left, right, up or down) of the next block"
-                let next_dir;
-                let next_dir_sign;
-                let mut i = self.last_level - 1;
-                loop {
-                    let level = &level_states[i];
-                    if level.progress == 3 {
-                        if i == 0 {
-                            next_dir = 0; // Default to X
-                            next_dir_sign = 0; // Positive X (move right)
-                            break;
+            ];
+
+            let bb_curve_type = match even_flags {
+                // T_B(E, E)
+                0b00 => {
+                    // Find "the location (left, right, up or down) of the next block"
+                    let next_dir;
+                    let next_dir_sign;
+                    let mut i = i - 1;
+                    loop {
+                        let level = &level_states[i];
+                        if level.progress == 3 {
+                            if i == 0 {
+                                next_dir = 0; // Default to X
+                                next_dir_sign = 0; // Positive X (move right)
+                                break;
+                            } else {
+                                i -= 1;
+                            }
                         } else {
-                            i -= 1;
+                            let adr = CURVE_ADDRESS_TABLE[level.curve_type as usize]
+                                >> (level.progress * 2) as u32;
+                            // adr[1:0] = current, adr[3:2] = next
+                            let adr_rel = adr ^ (adr >> 2);
+                            debug_assert!((adr_rel & 3) == 0b01 || (adr_rel & 3) == 0b10);
+                            next_dir = adr_rel & 1;
+                            next_dir_sign = ((adr & adr_rel & 0b11) != 0) as usize;
+                            break;
                         }
-                    } else {
-                        let adr = CURVE_ADDRESS_TABLE[level.curve_type as usize]
-                            >> (level.progress * 2) as u32;
-                        // adr[1:0] = current, adr[3:2] = next
-                        let adr_rel = adr ^ (adr >> 2);
-                        debug_assert!((adr_rel & 3) == 0b01 || (adr_rel & 3) == 0b10);
-                        next_dir = adr_rel & 1;
-                        next_dir_sign = ((adr & adr_rel & 0b11) != 0) as usize;
-                        break;
                     }
+                    SCANNING_TYPE[next_dir_sign][next_bb_enter as usize][next_dir as usize]
                 }
-                scanning_type_table[next_dir_sign][next_bb_enter as usize][next_dir as usize]
-            }
-            // T_B(E, O) - Type-2 basic pattern
-            0b01 => flags![BbFlags::{SECONDARY_DIR_NEG | END_X | END_Y}],
-            // T_B(O, E) - Reversed type-3 basic pattern
-            0b10 => flags![BbFlags::{PRIMARY_AXIS_Y | SECONDARY_DIR_NEG | END_X | END_Y}],
-            // T_B(O, O) - Unreachable because there can be only one T_B(O, O)
-            // a rectangle!
-            0b11 => unreachable!(),
-            _ => unreachable!(),
-        };
+                // T_B(E, O) - Reversed Type-2 basic pattern
+                0b01 => 4 | 2,
+                // T_B(O, E) - Reversed type-3 basic pattern
+                0b10 => 4 | 3,
+                // T_B(O, O) - Unreachable because there can be only one T_B(O, O)
+                // a rectangle!
+                0b11 => unreachable!(),
+                _ => unreachable!(),
+            };
 
-        self.bb_progress = if self.bb_flags.contains(BbFlags::PRIMARY_AXIS_Y) {
-            [size[1], size[0]]
-        } else {
-            [size[0], size[1]]
-        };
+            self.bb_secondary_neg = curve_secondary_negative_at_start(bb_curve_type) != 0;
+            self.bb_curve_type = bb_curve_type;
+            self.bb_end = curve_end_point(bb_curve_type);
+            self.bb_progress = if curve_primary_axis(bb_curve_type) != 0 {
+                [size[1], size[0]]
+            } else {
+                [size[0], size[1]]
+            };
+
+            // TODO: Maybe do the extra subdivision (i.e., dividing the smallest
+            // blocks defined by the top level of the algorithm in the paper)?
+        }
+
+        self.last_level = i;
 
         Some(position)
     }
