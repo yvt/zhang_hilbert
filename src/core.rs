@@ -18,9 +18,13 @@ pub struct LevelState<T> {
     ///
     /// Invariant: `i == 0 || cur.curve_type == CURVE_INDUCTION_TABLE[prev.curve_type][prev.progress]`
     /// where `cur` is `level_states[i]` and `prev` is `level_states[i - 1]`.
+    ///
+    /// Invalid for the last level (`last_level`).
     curve_type: u8,
     /// An integer in `0..4`. Indicates which subblock we are in this level's
-    /// block. Invalid for the last level.
+    /// block.
+    ///
+    /// Invalid for the last level (`last_level`).
     progress: u8,
 }
 
@@ -50,6 +54,7 @@ pub struct LevelState<T> {
 /// ```
 ///
 const CURVE_ADDRESS_TABLE: [u8; 8] = [
+    //XY_XY_XY_XY
     // Type 0
     0b10_11_01_00,
     // Type 1
@@ -72,8 +77,16 @@ const CURVE_ADDRESS_TABLE: [u8; 8] = [
 ///
 /// `CURVE_INDUCTION_TABLE[γ][i]` represents the curve type of `i`-th subblock
 /// within a block assigned a curve type `γ`.
-const CURVE_INDUCTION_TABLE: [[u8; 4]; 4] =
-    [[1, 0, 0, 3], [0, 1, 1, 2], [3, 2, 2, 1], [2, 3, 3, 0]];
+const CURVE_INDUCTION_TABLE: [[u8; 4]; 8] = [
+    [1, 0, 0, 3],
+    [0, 1, 1, 2],
+    [3, 2, 2, 1],
+    [2, 3, 3, 0],
+    [7, 4, 4, 5],
+    [6, 5, 5, 4],
+    [5, 6, 6, 7],
+    [4, 7, 7, 6],
+];
 
 /// Get the primary axis (X = 0, Y = 1) of a curve type.
 ///
@@ -122,6 +135,53 @@ fn division_l1<T: PrimInt + Unsigned>(size: T) -> T {
 
     let mask = T::one().unsigned_shl(m);
     (size & mask) + mask
+}
+
+/// Get the size of a extra-subdivided subblock.
+///
+/// `curve_type` is the curve type of the block containing the extra-subdivided
+/// subblock. `pos` specifies a subblock within the block.
+fn extra_division_subblock_size<T: PrimInt + Unsigned>(size: [T; 2], pos: u8) -> [T; 2] {
+    // If the block is odd-sized (`T_B(O, _)` and/or `T_B(_, O)`), we must
+    // be careful to make the subblocks' sizes compatible with their curve types.
+    //
+    // T_B(O, E) (first) - Type 0 + helper row
+    //    ,-, ,-, |
+    //    | '-' | |
+    //    '-, ,-' | TODO
+    //    --' '---'
+    //
+    // T_B(O, E) (other) - Reverse type-3
+    //  ,----, ^
+    //  '-,  '-'
+    //  ,-'  ,-,  l1 must be even
+    //  '----' |
+    //  \---/\-/
+    //    l0  l1
+    //
+    // T_B(E, O) (first) - Type-1 + helper row
+    //    ,----->
+    //    | ,---,
+    //    '-' ,-'  TODO
+    //    ,-, '-,
+    //    | '---'
+    //
+    // T_B(E, O) (other) - Type-2
+    //    --, ,-> \
+    //    ,-' '-, / l1  l1 must be even
+    //    | ,-, | \
+    //    | | | |  }l0
+    //    '-' '-' /
+    //
+    let three = T::from(3).unwrap();
+    let size_l1 = size.map(|x| (x + three) >> 2 << 1);
+    let size_l0 = [size[0] - size_l1[0], size[1] - size_l1[1]];
+    let (adr0, adr1) = ((pos & 0b10) != 0, (pos & 0b01) != 0);
+
+    [
+        if adr0 { size_l1[0] } else { size_l0[0] },
+        if adr1 { size_l1[1] } else { size_l0[1] },
+    ]
 }
 
 /// An iterator producing a pseudo-Hilbert scan.
@@ -229,6 +289,8 @@ where
             [1, 0] | [1, 1] => (0, 0b11),
             [_, _] => unreachable!(),
         };
+
+        // TODO: Perform the extra-subdivision on the first block
 
         let bb_secondary_neg = curve_secondary_negative_at_start(bb_curve_type) != 0;
 
@@ -365,7 +427,36 @@ where
             }
         }
 
-        while i + 1 < num_levels - 1 {
+        if i == num_levels - 2 {
+            // We were and are still in the same basic block and we just moved
+            // between extra-subdivided blocks.
+            let progress = level_states[i].progress;
+            let curve_type = level_states[i].curve_type;
+
+            let adr = CURVE_ADDRESS_TABLE[curve_type as usize] >> (progress * 2) as u32;
+            let bb_curve_type = CURVE_INDUCTION_TABLE[curve_type as usize][progress as usize];
+
+            let prev_size = level_states[i].size;
+            let size = extra_division_subblock_size(prev_size, adr);
+            level_states[i + 1].size = size;
+
+            self.bb_secondary_neg = curve_secondary_negative_at_start(bb_curve_type) != 0;
+            self.bb_curve_type = bb_curve_type;
+            self.bb_end = curve_end_point(bb_curve_type);
+            self.bb_progress = if curve_primary_axis(bb_curve_type) != 0 {
+                [size[1], size[0]]
+            } else {
+                [size[0], size[1]]
+            };
+
+            debug_assert_eq!(self.bb_progress[0] & T::one(), T::zero());
+            debug_assert_ne!(self.bb_progress[0], T::zero());
+            debug_assert_ne!(self.bb_progress[1], T::zero());
+
+            return Some(position);
+        }
+
+        while i < num_levels - 2 {
             let progress = level_states[i].progress;
             let curve_type = level_states[i].curve_type;
 
@@ -390,132 +481,141 @@ where
             i += 1;
         }
 
-        debug_assert!(i == num_levels - 1 || i == num_levels - 2);
+        // Now that a new block is found, the scanning pattern of the block
+        // must be determined.
+        //
+        // > we always know the entry point of the current scanned block
+        // > (T_B(E, E)) and the location (left, right, up or down) of the next
+        // > block. Then we can decide the scanning manner of this T_B(E, E)
+        // > block.
+        //
+        let mut size = level_states[i].size;
+        let even_flags = (((size[0] & T::zero()) << 1) | (size[1] & T::zero()))
+            .to_u8()
+            .unwrap();
 
-        // The condition `i == num_levels - 1` means that we were and are still
-        // in the same basic block and we just moved between extra-subdivided
-        // blocks.
-
-        if i == num_levels - 2 {
-            // Now that a new block is found, the scanning pattern of the block
-            // must be determined.
-            //
-            // > we always know the entry point of the current scanned block
-            // > (T_B(E, E)) and the location (left, right, up or down) of the next
-            // > block. Then we can decide the scanning manner of this T_B(E, E)
-            // > block.
-            //
-            let size = level_states[i].size;
-            let even_flags = (((size[0] & T::zero()) << 1) | (size[1] & T::zero()))
-                .to_u8()
-                .unwrap();
-
-            // I wonder why they didn't mention the memory consumption of this
-            // look-up table in the paper. (Not to mention the local variables...)
-            const SCANNING_TYPE: [[[u8; 2]; 4]; 2] = [
-                // Move right/up
+        // I wonder why they didn't mention the memory consumption of this
+        // look-up table in the paper. (Not to mention the local variables...)
+        const SCANNING_TYPE: [[[u8; 2]; 4]; 2] = [
+            // Move right/up
+            [
                 [
-                    [
-                        // Bottom-left to ...
-                        0, // 0b00 → 0b10 - Type-0 basic pattern
-                        1, // 0b00 → 0b01 - Type-1 basic pattern
-                    ],
-                    [
-                        // Top-left to ...
-                        4 | 2, // 0b01 → 0b11 - Reversed type-2 basic pattern
-                        4 | 2, // 0b01 → 0b11 - Reversed type-2 basic pattern
-                    ],
-                    [
-                        // bottom-right to ...
-                        4 | 3, // 0b10 → 0b11 - Reversed type-3 basic pattern
-                        4 | 3, // 0b10 → 0b11 - Reversed type-3 basic pattern
-                    ],
-                    [
-                        // top-right to ...
-                        3, // 0b11 → 0b10 - Type-3 basic pattern
-                        2, // 0b11 → 0b01 - Type-2 basic pattern
-                    ],
+                    // Bottom-left to ...
+                    0, // 0b00 → 0b10 - Type-0 basic pattern
+                    1, // 0b00 → 0b01 - Type-1 basic pattern
                 ],
-                // Move left/down
                 [
-                    [
-                        // Bottom-left to ...
-                        1, // 0b00 → 0b01 - Type-1 basic pattern
-                        0, // 0b00 → 0b10 - Type-0 basic pattern
-                    ],
-                    [
-                        // Top-left to ...
-                        4 | 1, // 0b01 → 0b00 - Reversed type-1 basic pattern
-                        4 | 1, // 0b01 → 0b00 - Reversed type-1 basic pattern
-                    ],
-                    [
-                        // bottom-right to ...
-                        4 | 0, // 0b10 → 0b00 - Reversed type-0 basic pattern
-                        4 | 0, // 0b10 → 0b00 - Reversed type-0 basic pattern
-                    ],
-                    [
-                        // top-right to ...
-                        2, // 0b11 → 0b01 - Type-2 basic pattern
-                        3, // 0b11 → 0b10 - Type-3 basic pattern
-                    ],
+                    // Top-left to ...
+                    4 | 2, // 0b01 → 0b11 - Reversed type-2 basic pattern
+                    4 | 2, // 0b01 → 0b11 - Reversed type-2 basic pattern
                 ],
-            ];
+                [
+                    // bottom-right to ...
+                    4 | 3, // 0b10 → 0b11 - Reversed type-3 basic pattern
+                    4 | 3, // 0b10 → 0b11 - Reversed type-3 basic pattern
+                ],
+                [
+                    // top-right to ...
+                    3, // 0b11 → 0b10 - Type-3 basic pattern
+                    2, // 0b11 → 0b01 - Type-2 basic pattern
+                ],
+            ],
+            // Move left/down
+            [
+                [
+                    // Bottom-left to ...
+                    1, // 0b00 → 0b01 - Type-1 basic pattern
+                    0, // 0b00 → 0b10 - Type-0 basic pattern
+                ],
+                [
+                    // Top-left to ...
+                    4 | 1, // 0b01 → 0b00 - Reversed type-1 basic pattern
+                    4 | 1, // 0b01 → 0b00 - Reversed type-1 basic pattern
+                ],
+                [
+                    // bottom-right to ...
+                    4 | 0, // 0b10 → 0b00 - Reversed type-0 basic pattern
+                    4 | 0, // 0b10 → 0b00 - Reversed type-0 basic pattern
+                ],
+                [
+                    // top-right to ...
+                    2, // 0b11 → 0b01 - Type-2 basic pattern
+                    3, // 0b11 → 0b10 - Type-3 basic pattern
+                ],
+            ],
+        ];
 
-            let bb_curve_type = match even_flags {
-                // T_B(E, E)
-                0b00 => {
-                    // Find "the location (left, right, up or down) of the next block"
-                    let next_dir;
-                    let next_dir_sign;
-                    let mut i = i - 1;
-                    loop {
-                        let level = &level_states[i];
-                        if level.progress == 3 {
-                            if i == 0 {
-                                next_dir = 0; // Default to X
-                                next_dir_sign = 0; // Positive X (move right)
-                                break;
-                            } else {
-                                i -= 1;
-                            }
-                        } else {
-                            let adr = CURVE_ADDRESS_TABLE[level.curve_type as usize]
-                                >> (level.progress * 2) as u32;
-                            // adr[1:0] = current, adr[3:2] = next
-                            let adr_rel = adr ^ (adr >> 2);
-                            debug_assert!((adr_rel & 3) == 0b01 || (adr_rel & 3) == 0b10);
-                            next_dir = adr_rel & 1;
-                            next_dir_sign = ((adr & adr_rel & 0b11) != 0) as usize;
+        let mut bb_curve_type = match even_flags {
+            // T_B(E, E)
+            0b00 => {
+                // Find "the location (left, right, up or down) of the next block"
+                let next_dir;
+                let next_dir_sign;
+                let mut i = i - 1;
+                loop {
+                    let level = &level_states[i];
+                    if level.progress == 3 {
+                        if i == 0 {
+                            next_dir = 0; // Default to X
+                            next_dir_sign = 0; // Positive X (move right)
                             break;
+                        } else {
+                            i -= 1;
                         }
+                    } else {
+                        let adr = CURVE_ADDRESS_TABLE[level.curve_type as usize]
+                            >> (level.progress * 2) as u32;
+                        // adr[1:0] = current, adr[3:2] = next
+                        let adr_rel = adr ^ (adr >> 2);
+                        debug_assert!((adr_rel & 3) == 0b01 || (adr_rel & 3) == 0b10);
+                        next_dir = adr_rel & 1;
+                        next_dir_sign = ((adr & adr_rel & 0b11) != 0) as usize;
+                        break;
                     }
-                    SCANNING_TYPE[next_dir_sign][next_bb_enter as usize][next_dir as usize]
                 }
-                // T_B(E, O) - Reversed Type-2 basic pattern
-                0b01 => 4 | 2,
-                // T_B(O, E) - Reversed type-3 basic pattern
-                0b10 => 4 | 3,
-                // T_B(O, O) - Unreachable because there can be only one T_B(O, O)
-                // a rectangle!
-                0b11 => unreachable!(),
-                _ => unreachable!(),
-            };
+                SCANNING_TYPE[next_dir_sign][next_bb_enter as usize][next_dir as usize]
+            }
+            // T_B(E, O) - Reversed Type-2 basic pattern
+            0b01 => 4 | 2,
+            // T_B(O, E) - Reversed type-3 basic pattern
+            0b10 => 4 | 3,
+            // T_B(O, O) - Unreachable because there can be only one T_B(O, O)
+            // a rectangle!
+            0b11 => unreachable!(),
+            _ => unreachable!(),
+        };
 
-            self.bb_secondary_neg = curve_secondary_negative_at_start(bb_curve_type) != 0;
-            self.bb_curve_type = bb_curve_type;
-            self.bb_end = curve_end_point(bb_curve_type);
-            self.bb_progress = if curve_primary_axis(bb_curve_type) != 0 {
-                [size[1], size[0]]
-            } else {
-                [size[0], size[1]]
-            };
+        let three = T::from(3u8).unwrap();
+        if size[0] >= three && size[1] >= three {
+            // If the block is large enough, we can (and should) do the extra
+            // subdivision (i.e., dividing the smallest blocks defined by the
+            // top level of the algorithm in the paper)
+            level_states[i].progress = 0;
+            level_states[i].curve_type = bb_curve_type;
 
-            // TODO: Maybe do the extra subdivision (i.e., dividing the smallest
-            // blocks defined by the top level of the algorithm in the paper)?
+            size = extra_division_subblock_size(size, next_bb_enter);
+            bb_curve_type = CURVE_INDUCTION_TABLE[bb_curve_type as usize][0];
+
+            i += 1;
+            debug_assert_eq!(i, num_levels - 1);
+            level_states[i].size = size;
+        } else {
+            // Otherwise, apply the basic scanning pattern on this block.
         }
+        self.bb_secondary_neg = curve_secondary_negative_at_start(bb_curve_type) != 0;
+        self.bb_curve_type = bb_curve_type;
+        self.bb_end = curve_end_point(bb_curve_type);
+        self.bb_progress = if curve_primary_axis(bb_curve_type) != 0 {
+            [size[1], size[0]]
+        } else {
+            [size[0], size[1]]
+        };
+
+        debug_assert_eq!(self.bb_progress[0] & T::one(), T::zero());
+        debug_assert_ne!(self.bb_progress[0], T::zero());
+        debug_assert_ne!(self.bb_progress[1], T::zero());
 
         self.last_level = i;
-
         Some(position)
     }
 }
