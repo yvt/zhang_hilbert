@@ -231,6 +231,8 @@ where
     /// default-constructed to have zero elements. Rather, this function is
     /// useful when `LevelSt` has a predetermined number of elements like
     /// `[LevelState<T>; 32]` does.
+    ///
+    /// [`with_level_state_storage`]: HilbertScanCore::with_level_state_storage
     pub fn new(size: [T; 2]) -> Self
     where
         LevelSt: Default,
