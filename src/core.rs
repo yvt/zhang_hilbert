@@ -141,15 +141,17 @@ fn division_l1<T: PrimInt + Unsigned>(size: T) -> T {
 ///
 /// `curve_type` is the curve type of the block containing the extra-subdivided
 /// subblock. `pos` specifies a subblock within the block.
-fn extra_division_subblock_size<T: PrimInt + Unsigned>(size: [T; 2], pos: u8) -> [T; 2] {
+fn extra_division_subblock_size<T: PrimInt + Unsigned>(size: [T; 2], mut pos: u8, curve_type: u8) -> [T; 2] {
     // If the block is odd-sized (`T_B(O, _)` and/or `T_B(_, O)`), we must
     // be careful to make the subblocks' sizes compatible with their curve types.
     //
     // T_B(O, E) (first) - Type 0 + helper row
-    //    ,-, ,-, |
-    //    | '-' | |
-    //    '-, ,-' | TODO
-    //    --' '---'
+    // T_B(O, O) (first) - Type 0 + helper row
+    //    ,-, ,-, | \
+    //    | | | | |  } l1
+    //    | '-' | | /
+    //    '-, ,-' | \
+    //    --' '---' / l0  l0 must be even
     //
     // T_B(O, E) (other) - Reverse type-3
     //  ,----, ^
@@ -176,6 +178,9 @@ fn extra_division_subblock_size<T: PrimInt + Unsigned>(size: [T; 2], pos: u8) ->
     let three = T::from(3).unwrap();
     let size_l1 = size.map(|x| (x + three) >> 2 << 1);
     let size_l0 = [size[0] - size_l1[0], size[1] - size_l1[1]];
+
+    pos ^= (curve_type == 0) as u8;
+
     let (adr0, adr1) = ((pos & 0b10) != 0, (pos & 0b01) != 0);
 
     [
@@ -202,6 +207,7 @@ pub struct HilbertScanCore<T, LevelSt> {
     bb_secondary_neg: bool,
     bb_curve_type: u8,
     bb_end: u8,
+    bb_helper_row: bool,
 
     done: bool,
 }
@@ -209,7 +215,7 @@ pub struct HilbertScanCore<T, LevelSt> {
 impl<T, LevelSt> HilbertScanCore<T, LevelSt>
 where
     LevelSt: BorrowMut<[LevelState<T>]>,
-    T: PrimInt + Unsigned,
+    T: PrimInt + Unsigned + std::fmt::Debug,
 {
     /// Construct a `HilbertScanCore` with a default-constructed `LevelSt`.
     ///
@@ -236,7 +242,7 @@ where
     pub fn with_level_state_storage(mut level_states: LevelSt, size: [T; 2]) -> Self {
         let num_levels = num_levels_for_size(size);
         let mut last_level;
-        let mut last_size;
+        let (bb_curve_type, bb_helper_row, bb_progress);
         {
             let level_states = &mut level_states.borrow_mut()[0..num_levels];
             level_states[0] = LevelState {
@@ -253,52 +259,64 @@ where
                 };
             }
             last_level = num_levels - 2;
-            last_size = level_states[last_level].size;
 
-            // Perform the extra subdivision
-            if (size[0] & size[1] & T::one()) == T::zero() {
-                if last_size[0] >= T::from(4).unwrap() && last_size[1] >= T::from(4).unwrap() {
-                    last_level += 1;
-                    last_size = last_size.map(|x| x - division_l1(x));
-                    level_states[last_level] = LevelState {
-                        size: last_size,
-                        curve_type: (last_level % 2) as u8, // CURVE_INDUCTION_TABLE[prev.curve_type as usize][0],
-                        progress: 0,
-                    };
-                }
+            // Set up the scan of the first block
+            let last_curve_type = last_level % 2;
+            let (curve_type, helper) = match size.map(|x| (x & T::one()).to_u8().unwrap()) {
+                // T_R(E, E)
+                [0, 0] => (last_curve_type as u8, false),
+                // T_R(E, O) - Type-1 basic pattern + helper row
+                //
+                //  ,------>  - Helper row
+                //  '------,  \
+                //    ...      } Type-1 basic pattern
+                //  -------'  /
+                //
+                [0, 1] => (1, true),
+                // T_R(O, E), T_R(O, O) - Type-0 basic pattern + helper row
+                [1, 0] | [1, 1] => (0, true),
+                [_, _] => unreachable!(),
+            };
+
+            if helper {
+                // The helper row is specially handled, so exclude it from
+                // the block's size
+                let last_size = &mut level_states[last_level].size;
+                let pri_size = &mut last_size[curve_primary_axis(curve_type) as usize];
+                *pri_size = *pri_size - T::one();
             }
+
+            let mut last_size = level_states[last_level].size;
+
+            level_states[last_level].curve_type = curve_type;
+
+            // Try the extra-subdivision on the first block.
+            let three = T::from(3u8).unwrap();
+            if last_size[0] >= three && last_size[1] >= three {
+                // If the block is large enough, we can (and should) do the extra
+                // subdivision.
+                level_states[last_level].progress = 0;
+
+                last_size = extra_division_subblock_size(last_size, 0b00, curve_type);
+                bb_curve_type = CURVE_INDUCTION_TABLE[curve_type as usize][0];
+
+                last_level += 1;
+                level_states[last_level].size = last_size;
+            } else {
+                // Otherwise, apply the basic scanning pattern on this block.
+                bb_curve_type = curve_type;
+            }
+
+            bb_helper_row = helper;
+            bb_progress = if curve_primary_axis(bb_curve_type) != 0 {
+                [last_size[1], last_size[0]]
+            } else {
+                [last_size[0], last_size[1]]
+            };
         }
 
-        // Set up the scan of the first block
-        let last_curve_type = last_level % 2;
-        let (bb_curve_type, bb_end) = match size.map(|x| (x & T::one()).to_u8().unwrap()) {
-            // T_R(E, E)
-            [0, 0] => (
-                last_curve_type as u8,
-                curve_end_point(last_curve_type as u8),
-            ),
-            // T_R(E, O) - Type-1 basic pattern + helper row
-            //
-            //  ,------>  - Helper row
-            //  '------,  \
-            //    ...      } Type-1 basic pattern
-            //  -------'  /
-            //
-            [0, 1] => (1, 0b11),
-            // T_R(O, E), T_R(O, O) - Type-0 basic pattern + helper row
-            [1, 0] | [1, 1] => (0, 0b11),
-            [_, _] => unreachable!(),
-        };
-
-        // TODO: Perform the extra-subdivision on the first block
-
         let bb_secondary_neg = curve_secondary_negative_at_start(bb_curve_type) != 0;
-
-        let bb_progress = if curve_primary_axis(bb_curve_type) != 0 {
-            [last_size[1], last_size[0]]
-        } else {
-            [last_size[0], last_size[1]]
-        };
+        let bb_end = curve_end_point(bb_curve_type);
 
         Self {
             size,
@@ -310,6 +328,7 @@ where
             bb_secondary_neg,
             bb_curve_type,
             bb_end,
+            bb_helper_row,
             done: false,
         }
     }
@@ -373,7 +392,43 @@ where
             return Some(position);
         }
 
-        if num_levels <= 2 {
+        if self.bb_helper_row {
+            let block_done = if self.last_level == num_levels - 2 {
+                true
+            } else {
+                level_states[num_levels - 2].progress == 3
+            };
+
+            if block_done {
+                // The current block is complete. Now, generate the helper row.
+                // The current block requires a helper row so that we can exit
+                // the block at the intended (top-right) corner.
+                //    ,----->  ← helper row
+                //    | ,---,  \
+                //    '-' ,-'  | Type-1 curve
+                //    ,-, '-,  |
+                //    | '---'  /
+                //
+                let level = &mut level_states[num_levels - 2];
+                let pri_axis = curve_primary_axis(level.curve_type) as usize;
+                let sec_axis = pri_axis ^ 1;
+                let sec_width = level.size[sec_axis];
+
+                self.bb_end = 0b11;
+                self.bb_curve_type = level.curve_type;
+                self.bb_secondary_neg = false;
+                self.bb_progress = [T::one(), sec_width];
+
+                self.bb_helper_row = false;
+
+                self.position[pri_axis] = self.position[pri_axis] + T::one();
+                self.last_level = num_levels - 2;
+
+                return Some(position);
+            }
+        }
+
+        if self.last_level == 0 {
             self.done = true;
             return Some(position);
         }
@@ -437,7 +492,7 @@ where
             let bb_curve_type = CURVE_INDUCTION_TABLE[curve_type as usize][progress as usize];
 
             let prev_size = level_states[i].size;
-            let size = extra_division_subblock_size(prev_size, adr);
+            let size = extra_division_subblock_size(prev_size, adr, curve_type);
             level_states[i + 1].size = size;
 
             self.bb_secondary_neg = curve_secondary_negative_at_start(bb_curve_type) != 0;
@@ -593,7 +648,7 @@ where
             level_states[i].progress = 0;
             level_states[i].curve_type = bb_curve_type;
 
-            size = extra_division_subblock_size(size, next_bb_enter);
+            size = extra_division_subblock_size(size, next_bb_enter, bb_curve_type);
             bb_curve_type = CURVE_INDUCTION_TABLE[bb_curve_type as usize][0];
 
             i += 1;
