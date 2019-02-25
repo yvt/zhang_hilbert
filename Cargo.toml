@@ -12,3 +12,4 @@ flags-macro = "0.1.3"
 
 [dev-dependencies]
 ndarray = "0.12.1"
+clap = "2.26.0"
