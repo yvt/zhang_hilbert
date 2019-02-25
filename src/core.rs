@@ -387,10 +387,6 @@ where
 {
     type Item = [T; 2];
 
-    // Inlining this method opens useful optimization opportunities:
-    //  - `self.done` checks can be eliminated
-    //  - Array bounds checks on `level_states` can be eliminated
-    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
