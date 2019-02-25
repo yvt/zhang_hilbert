@@ -3,6 +3,13 @@ name = "zhang_hilbert"
 version = "0.1.0"
 authors = ["yvt <i@yvt.jp>"]
 edition = "2018"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/yvt/zhang_hilbert"
+description = """
+Produces an arbitrary-sized pseudo-Hilbert scan based on
+“A Pseudo-Hilbert Scan for Arbitrarily-Sized Arrays” by Zhang, et al.
+"""
+keywords = ["hilbert", "curve", "algorithm"]
 
 [dependencies]
 num = { version = "0.2.0", default-features = false }
