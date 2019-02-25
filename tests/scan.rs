@@ -4,8 +4,8 @@ use zhang_hilbert::HilbertScan32;
 
 #[test]
 fn scan32_patterns() {
-    for w in 2..32 {
-        for h in 2..32 {
+    for w in 0..32 {
+        for h in 0..32 {
             println!("=== {:?} ===", [w, h]);
             let scan = HilbertScan32::new([w, h]);
             let mut map: Array2<usize> = Array2::zeros([h as usize, w as usize]);

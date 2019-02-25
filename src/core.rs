@@ -115,14 +115,16 @@ fn curve_end_point(c: u8) -> u8 {
 
 /// Get the number of [`LevelState`]s required by [`HilbertScanCore`] to
 /// hold its internal state.
-///
-/// `size[0]` and `size[1]` must be both greater than `1`.
 pub fn num_levels_for_size<T: PrimInt + Unsigned>(size: [T; 2]) -> usize {
-    assert!(size[0] > T::one());
-    assert!(size[1] > T::one());
-    // Allocate one extra level so that we can perform the extra subdivision
-    // on the last (`log2_floor(min(size[0], size[1])) - 1`-th) level
-    log2_floor(min(size[0], size[1])) as usize + 1
+    if size[0] <= T::one() || size[1] <= T::one() {
+        // In this case, the contents of `level_states` aren't used at all but
+        // they are still accessed
+        1
+    } else {
+        // Allocate one extra level so that we can perform the extra subdivision
+        // on the last (`log2_floor(min(size[0], size[1])) - 1`-th) level
+        log2_floor(min(size[0], size[1])) as usize + 1
+    }
 }
 
 fn log2_floor<T: PrimInt>(x: T) -> u32 {
@@ -141,7 +143,11 @@ fn division_l1<T: PrimInt + Unsigned>(size: T) -> T {
 ///
 /// `curve_type` is the curve type of the block containing the extra-subdivided
 /// subblock. `pos` specifies a subblock within the block.
-fn extra_division_subblock_size<T: PrimInt + Unsigned>(size: [T; 2], mut pos: u8, curve_type: u8) -> [T; 2] {
+fn extra_division_subblock_size<T: PrimInt + Unsigned>(
+    size: [T; 2],
+    mut pos: u8,
+    curve_type: u8,
+) -> [T; 2] {
     // If the block is odd-sized (`T_B(O, _)` and/or `T_B(_, O)`), we must
     // be careful to make the subblocks' sizes compatible with their curve types.
     //
@@ -232,6 +238,22 @@ where
         Self::with_level_state_storage(LevelSt::default(), size)
     }
 
+    fn empty(level_states: LevelSt, size: [T; 2]) -> Self {
+        Self {
+            size,
+            num_levels: 1,
+            last_level: 0,
+            level_states,
+            position: [T::zero(), T::zero()],
+            bb_progress: [T::zero(), T::zero()],
+            bb_secondary_neg: false,
+            bb_curve_type: 0,
+            bb_end: 0,
+            bb_helper_row: false,
+            done: true,
+        }
+    }
+
     /// Construct a `HilbertScanCore` with an explicit `LevelSt`.
     ///
     /// The slice borrowed by `level_states` must have a specific minimum
@@ -240,6 +262,28 @@ where
     /// The elements do not have to be initialized as they are overwritten
     /// by this function.
     pub fn with_level_state_storage(mut level_states: LevelSt, size: [T; 2]) -> Self {
+        if size[0] == T::zero() || size[1] == T::zero() {
+            return Self::empty(level_states, size);
+        }
+
+        if size[0] == T::one() {
+            return Self {
+                done: false,
+                bb_progress: [T::one(), size[1]],
+                bb_curve_type: 0,
+                ..Self::empty(level_states, size)
+            };
+        }
+
+        if size[1] == T::one() {
+            return Self {
+                done: false,
+                bb_progress: [T::one(), size[0]],
+                bb_curve_type: 1,
+                ..Self::empty(level_states, size)
+            };
+        }
+
         let num_levels = num_levels_for_size(size);
         let mut last_level;
         let (bb_curve_type, bb_helper_row, bb_progress);
