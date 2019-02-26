@@ -143,7 +143,7 @@ fn division_l1<T: PrimInt + Unsigned>(size: T) -> T {
 ///
 /// `curve_type` is the curve type of the block containing the extra-subdivided
 /// subblock. `pos` specifies a subblock within the block.
-fn extra_division_subblock_size<T: PrimInt + Unsigned>(
+fn extra_division_subblock_size<T: PrimInt + Unsigned + std::fmt::Debug>(
     size: [T; 2],
     mut pos: u8,
     curve_type: u8,
@@ -170,9 +170,18 @@ fn extra_division_subblock_size<T: PrimInt + Unsigned>(
     // T_B(E, O) (first) - Type-1 + helper row
     //    ,----->
     //    | ,---,
-    //    '-' ,-'  TODO
+    //    '-' ,-'
     //    ,-, '-,
     //    | '---'
+    //
+    // T_B(E, O) (last) - Reverse type-1 + helper row
+    //  | ,----,
+    //  '-'  ,-'
+    //  ,-,  '-,  l0 must be even
+    //  | '----'
+    //  '------>
+    //  \---/\-/
+    //    l0  l1
     //
     // T_B(E, O) (other) - Type-2
     //    --, ,-> \
@@ -185,7 +194,7 @@ fn extra_division_subblock_size<T: PrimInt + Unsigned>(
     let size_l1 = size.map(|x| (x + three) >> 2 << 1);
     let size_l0 = [size[0] - size_l1[0], size[1] - size_l1[1]];
 
-    pos ^= (curve_type == 0) as u8;
+    pos ^= (curve_type == 0 || curve_type == 5) as u8;
 
     let (adr0, adr1) = ((pos & 0b10) != 0, (pos & 0b01) != 0);
 
@@ -199,6 +208,24 @@ fn extra_division_subblock_size<T: PrimInt + Unsigned>(
 ///
 /// `T` is a type used to represent the output coordinates. `LevelSt` is
 /// a mutable reference to a slice of `LevelState<T>`s.
+///
+/// # Output properties
+///
+/// The output is a sequence that includes every 2D points such that
+/// `xᵢ ∈ ℕ ∩ [0, size[0] - 1], yᵢ ∈ ℕ ∩ [0, size[1] - 1]`.
+/// Every two adjacent points are distant exactly by an unit distance and the
+/// path drawn by the sequence never intersects with itself.
+///
+/// The sequence starts at `(0, 0)`. The last point in the sequence has
+/// the grid coordinates `(size[0] - 1, y)`. `y` has guarantees for certain
+/// rectangle sizes:
+///
+///  - `y` is `0` if both of `size[0]` and `size[1]` are even numbers.
+///  - `y` is `0` if `size[0]` is an even number and both of `size[0]` and
+///    `size[1]` are greater-than-or-equal to `4`.
+///  - `y` is `size[1] - 1` if `size[0]` is an even number, `size[1]` is an
+///    odd number, and at least one of `size[0]` and `size[1]` are less than `4`.
+///
 #[derive(Debug)]
 pub struct HilbertScanCore<T, LevelSt> {
     size: [T; 2],
@@ -378,6 +405,11 @@ where
             done: false,
         }
     }
+
+    /// Get the wrapped `LevelSt`, consuming `self`.
+    pub fn into_level_states(self) -> LevelSt {
+        self.level_states
+    }
 }
 
 impl<T, LevelSt> Iterator for HilbertScanCore<T, LevelSt>
@@ -444,7 +476,7 @@ where
             if block_done {
                 // The current block is complete. Now, generate the helper row.
                 // The current block requires a helper row so that we can exit
-                // the block at the intended (top-right) corner.
+                // the block at the intended (top-right or bottom-right) corner.
                 //    ,----->  ← helper row
                 //    | ,---,  \
                 //    '-' ,-'  | Type-1 curve
@@ -463,7 +495,12 @@ where
 
                 self.bb_helper_row = false;
 
-                self.position[pri_axis] = self.position[pri_axis] + T::one();
+                let pri_pos = &mut self.position[pri_axis];
+                if curve_primary_negative(self.bb_curve_type) != 0 {
+                    *pri_pos = *pri_pos - T::one();
+                } else {
+                    *pri_pos = *pri_pos + T::one();
+                }
                 self.last_level = num_levels - 2;
 
                 return Some(position);
@@ -550,6 +587,8 @@ where
             debug_assert_ne!(self.bb_progress[0], T::zero());
             debug_assert_ne!(self.bb_progress[1], T::zero());
 
+            debug_assert_eq!(self.last_level, num_levels - 1);
+
             return Some(position);
         }
 
@@ -587,7 +626,7 @@ where
         // > block.
         //
         let mut size = level_states[i].size;
-        let even_flags = (((size[0] & T::zero()) << 1) | (size[1] & T::zero()))
+        let even_flags = (((size[0] & T::one()) << 1) | (size[1] & T::one()))
             .to_u8()
             .unwrap();
 
@@ -642,7 +681,7 @@ where
             ],
         ];
 
-        let mut bb_curve_type = match even_flags {
+        let (mut bb_curve_type, helper) = match even_flags {
             // T_B(E, E)
             0b00 => {
                 // Find "the location (left, right, up or down) of the next block"
@@ -670,17 +709,41 @@ where
                         break;
                     }
                 }
-                SCANNING_TYPE[next_dir_sign][next_bb_enter as usize][next_dir as usize]
+                (
+                    SCANNING_TYPE[next_dir_sign][next_bb_enter as usize][next_dir as usize],
+                    false,
+                )
             }
-            // T_B(E, O) - Reversed Type-2 basic pattern
-            0b01 => 4 | 2,
+            0b01 => {
+                let is_last_block = [
+                    self.position[0] + size[0],
+                    self.position[1] + T::one() - size[1],
+                ] == [self.size[0], T::zero()];
+                if is_last_block {
+                    // T_B(E, O) - Reversed Type-1 basic pattern + helper row
+                    // (This is a deviation from the original algorithm)
+                    (4 | 1, true)
+                } else {
+                    // T_B(E, O) - Reversed Type-2 basic pattern
+                    (4 | 2, false)
+                }
+            }
             // T_B(O, E) - Reversed type-3 basic pattern
-            0b10 => 4 | 3,
+            0b10 => (4 | 3, false),
             // T_B(O, O) - Unreachable because there can be only one T_B(O, O)
             // a rectangle!
             0b11 => unreachable!(),
             _ => unreachable!(),
         };
+
+        if helper {
+            debug_assert_eq!(bb_curve_type, 4 | 1);
+            debug_assert_eq!(curve_primary_axis(bb_curve_type), 1);
+            // Exclude the helper row from the block size
+            size[1] = size[1] - T::one();
+            level_states[i].size = size;
+        }
+        level_states[i].curve_type = bb_curve_type;
 
         let three = T::from(3u8).unwrap();
         if size[0] >= three && size[1] >= three {
@@ -688,7 +751,6 @@ where
             // subdivision (i.e., dividing the smallest blocks defined by the
             // top level of the algorithm in the paper)
             level_states[i].progress = 0;
-            level_states[i].curve_type = bb_curve_type;
 
             size = extra_division_subblock_size(size, next_bb_enter, bb_curve_type);
             bb_curve_type = CURVE_INDUCTION_TABLE[bb_curve_type as usize][0];
@@ -707,6 +769,7 @@ where
         } else {
             [size[0], size[1]]
         };
+        self.bb_helper_row = helper;
 
         debug_assert_eq!(self.bb_progress[0] & T::one(), T::zero());
         debug_assert_ne!(self.bb_progress[0], T::zero());
