@@ -24,7 +24,7 @@ fn main() {
                 .long("format")
                 .help("Set the output format")
                 .takes_value(true)
-                .possible_values(&["ascii", "svg"])
+                .possible_values(&["ascii", "svg", "json", "csv", "tsv"])
                 .default_value("ascii"),
         )
         .arg(
@@ -115,8 +115,47 @@ fn main() {
             let s: String = slice.iter().cloned().collect();
             println!("{}", s);
         }
+    } else if format == "json" {
+        println!("[");
+        let mut scan = scan.peekable();
+        while let Some([x, y]) = scan.next() {
+            if scan.peek().is_some() {
+                println!("  [{}, {}],", x, y);
+            } else {
+                println!("  [{}, {}]", x, y);
+            }
+        }
+        println!("]");
+    } else if format == "csv" {
+        for [x, y] in scan {
+            println!("{}, {}", x, y);
+        }
+    } else if format == "tsv" {
+        for [x, y] in scan {
+            println!("{}\t{}", x, y);
+        }
     } else if format == "svg" {
-
+        const SCALE: u32 = 10;
+        println!(r#"<?xml version="1.0" encoding="utf-8"?>"#);
+        println!(
+            r#"<svg version="1.1" xmlns="http://www.w3.org/2000/svg"
+            xmlns:xlink="http://www.w3.org/1999/xlink" x="0px" y="0px"
+            viewBox="0 0 {} {}">"#,
+            (size_w + 1) * SCALE,
+            (size_h + 1) * SCALE,
+        );
+        print!(r#"<path d=""#);
+        for (i, [x, y]) in scan.enumerate() {
+            let cmd = if i == 0 { 'M' } else { 'L' };
+            print!(
+                "{}{},{}",
+                cmd,
+                (x + 1) * SCALE,
+                (size_h - 1 - y + 1) * SCALE
+            );
+        }
+        println!(r#"" fill="none" stroke="black"/>"#);
+        println!(r#"</svg>"#);
     }
 }
 
