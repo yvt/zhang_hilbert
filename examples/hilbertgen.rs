@@ -1,5 +1,5 @@
 use ndarray::{s, Array2};
-use zhang_hilbert::HilbertScan32;
+use zhang_hilbert::{ArbHilbertScan32, HilbertScan32};
 
 fn main() {
     use clap::{App, Arg};
@@ -27,6 +27,15 @@ fn main() {
                 .possible_values(&["ascii", "svg"])
                 .default_value("ascii"),
         )
+        .arg(
+            Arg::with_name("algorithm")
+                .short("a")
+                .long("algorithm")
+                .help("Set the algorithm")
+                .takes_value(true)
+                .possible_values(&["zhang", "zhang-arb"])
+                .default_value("zhang-arb"),
+        )
         .get_matches();
 
     let size_w: u32 = matches
@@ -38,7 +47,14 @@ fn main() {
         .and_then(|x| x.parse().ok())
         .expect("Invalid height");
 
-    let scan = HilbertScan32::new([size_w, size_h]);
+    let algo = matches.value_of("algorithm").unwrap();
+    let scan: Box<dyn Iterator<Item = [u32; 2]>> = if algo == "zhang" {
+        Box::new(HilbertScan32::new([size_w, size_h]))
+    } else if algo == "zhang-arb" {
+        Box::new(ArbHilbertScan32::new([size_w, size_h]))
+    } else {
+        unreachable!()
+    };
 
     let format = matches.value_of("format").unwrap();
 
