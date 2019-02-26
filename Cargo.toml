@@ -18,3 +18,4 @@ array = "0.0.1"
 [dev-dependencies]
 ndarray = "0.12.1"
 clap = "2.26.0"
+sdl2 = "0.32.1"
