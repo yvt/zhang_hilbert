@@ -159,6 +159,13 @@ fn extra_division_subblock_size<T: PrimInt + Unsigned + std::fmt::Debug>(
     //    '-, ,-' | \
     //    --' '---' / l0  l0 must be even
     //
+    // T_B(E, O) (first & last) - Type 0
+    //    ,-, ,-,  \
+    //    | | | |   } l1
+    //    | '-' |  /
+    //    '-, ,-'  \
+    //    --' '--- / l0  l0 must be even
+    //
     // T_B(O, E) (other) - Reverse type-3
     //  ,----, ^
     //  '-,  '-'
@@ -221,10 +228,7 @@ fn extra_division_subblock_size<T: PrimInt + Unsigned + std::fmt::Debug>(
 /// rectangle sizes:
 ///
 ///  - `y` is `0` if both of `size[0]` and `size[1]` are even numbers.
-///  - `y` is `0` if `size[0]` is an even number and both of `size[0]` and
-///    `size[1]` are greater-than-or-equal to `4`.
-///  - `y` is `size[1] - 1` if `size[0]` is an even number, `size[1]` is an
-///    odd number, and at least one of `size[0]` and `size[1]` are less than `4`.
+///  - `y` is `0` if `size[0]` is an even number.
 ///
 #[derive(Debug)]
 pub struct HilbertScanCore<T, LevelSt> {
@@ -338,14 +342,21 @@ where
             let (curve_type, helper) = match size.map(|x| (x & T::one()).to_u8().unwrap()) {
                 // T_R(E, E)
                 [0, 0] => (last_curve_type as u8, false),
-                // T_R(E, O) - Type-1 basic pattern + helper row
-                //
-                //  ,------>  - Helper row
-                //  '------,  \
-                //    ...      } Type-1 basic pattern
-                //  -------'  /
-                //
-                [0, 1] => (1, true),
+                [0, 1] => {
+                    if num_levels == 2 {
+                        // T_R(E, O) (first & last) - Type-0 basic pattern
+                        (0, false)
+                    } else {
+                        // T_R(E, O) - Type-1 basic pattern + helper row
+                        //
+                        //  ,------>  - Helper row
+                        //  '------,  \
+                        //    ...      } Type-1 basic pattern
+                        //  -------'  /
+                        //
+                        (1, true)
+                    }
+                }
                 // T_R(O, E), T_R(O, O) - Type-0 basic pattern + helper row
                 [1, 0] | [1, 1] => (0, true),
                 [_, _] => unreachable!(),

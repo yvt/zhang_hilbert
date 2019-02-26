@@ -25,6 +25,12 @@
 //!   '-, ,-' '-,        '-, ,-----'
 //!   --' '-----'        --' '------
 //!    Original      This implementation
+//!
+//! cargo run --example hilbertgen -- 4 3
+//!     ,------           ,-----,
+//!     '-----,           '-, ,-'
+//!     ------'           --' '--
+//!    Original      This implementation
 //! ```
 //!
 //! ## Aspect-ratio bounded tiling
