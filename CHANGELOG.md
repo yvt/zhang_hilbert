@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## 0.1.0 - 2019-02-26
+
 - Initial release.
 
-[Unreleased]: https://github.com/yvt/zhang_hilbert/compare/HEAD...v0.2.4
+[Unreleased]: https://github.com/yvt/zhang_hilbert/compare/HEAD...v0.1.0
