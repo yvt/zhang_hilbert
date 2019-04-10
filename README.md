@@ -1,6 +1,6 @@
 # `zhang_hilbert`
 
-[<img src="https://docs.rs/zhang_hilbert/badge.svg" alt="docs.rs">](https://docs.rs/xalloc/)
+[<img src="https://docs.rs/zhang_hilbert/badge.svg" alt="docs.rs">](https://docs.rs/zhang_hilbert/)
 
 This crate provides iterator types that produce an arbitrary-sized
 pseudo-Hilbert scan based on “A Pseudo-Hilbert Scan for Arbitrarily-Sized
