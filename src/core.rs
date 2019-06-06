@@ -423,6 +423,13 @@ where
     }
 }
 
+impl<T, LevelSt> std::iter::FusedIterator for HilbertScanCore<T, LevelSt>
+where
+    LevelSt: BorrowMut<[LevelState<T>]>,
+    T: PrimInt + Unsigned + std::fmt::Debug,
+{
+}
+
 impl<T, LevelSt> Iterator for HilbertScanCore<T, LevelSt>
 where
     LevelSt: BorrowMut<[LevelState<T>]>,

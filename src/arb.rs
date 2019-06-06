@@ -96,6 +96,13 @@ where
     }
 }
 
+impl<T, LevelSt> std::iter::FusedIterator for ArbHilbertScanCore<T, LevelSt>
+where
+    LevelSt: BorrowMut<[LevelState<T>]>,
+    T: PrimInt + Unsigned + std::fmt::Debug,
+{
+}
+
 impl<T, LevelSt> Iterator for ArbHilbertScanCore<T, LevelSt>
 where
     LevelSt: BorrowMut<[LevelState<T>]>,
